@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: kalshi
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-kalshi_secure_pw}
+      POSTGRES_DB: kalshi
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kalshi"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  crypto-bot:
+    build:
+      context: ../kalshi-trading-bot
+      dockerfile: Dockerfile
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      KALSHI_API_KEY_ID: ${KALSHI_API_KEY_ID}
+      KALSHI_PRIVATE_KEY: ${KALSHI_PRIVATE_KEY}
+      KALSHI_API_HOST: https://api.elections.kalshi.com
+      DATABASE_URL: postgresql://kalshi:${DB_PASSWORD:-kalshi_secure_pw}@db:5432/kalshi
+      ENABLE_TRADING: ${ENABLE_TRADING:-false}
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+
+  weather-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      KALSHI_API_KEY_ID: ${KALSHI_API_KEY_ID}
+      KALSHI_PRIVATE_KEY: ${KALSHI_PRIVATE_KEY}
+      KALSHI_API_HOST: https://api.elections.kalshi.com
+      DATABASE_URL: postgresql://kalshi:${DB_PASSWORD:-kalshi_secure_pw}@db:5432/kalshi_weather
+      ENABLE_TRADING: ${ENABLE_TRADING:-false}
+      PORT: "8081"
+    ports:
+      - "8081:8081"
+
+volumes:
+  pgdata:
