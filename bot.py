@@ -1,7 +1,7 @@
 """
-Weather edge bot for Kalshi. Uses Open-Meteo forecasts to find mispriced
-weather markets (temperature, precip, snow). Buys when forecast-implied
-probability diverges significantly from market price.
+Weather Edge Bot for Kalshi. Uses GFS 31-member ensemble forecasts
+targeted at exact NWS station coordinates to find mispriced weather
+markets. Fractional Kelly sizing. Circuit breakers.
 """
 
 import os, time, logging, traceback, math, re
@@ -12,8 +12,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from kalshi_auth import KalshiAuth
 from weather import (
-    fetch_all_forecasts, estimate_prob_above, estimate_prob_below,
-    estimate_precip_prob, estimate_snow_prob, CITIES,
+    fetch_all_forecasts, ensemble_prob_above, ensemble_prob_below,
+    gaussian_prob_above, estimate_precip_prob, estimate_snow_prob,
+    kelly_size, STATIONS,
 )
 import requests
 from requests.adapters import HTTPAdapter
@@ -28,47 +29,71 @@ DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://kalshi:kalshi@localh
 PORT = int(os.environ.get('PORT', 8080))
 ENABLE_TRADING = os.environ.get('ENABLE_TRADING', 'false').lower() == 'true'
 
-# === STRATEGY ===
-MIN_EDGE = 0.15          # need 15% edge (forecast prob - market price) to buy
-MAX_PRICE = 0.85         # don't buy above $0.85
-MIN_PRICE = 0.05         # don't buy below $0.05
-CONTRACTS = 1             # contracts per trade
-MAX_POSITIONS = 50        # max total open positions
-MAX_PER_MARKET = 3        # max positions on same market
-CYCLE_SECONDS = 60        # weather markets move slower than crypto
+# === STRATEGY (proven params from research) ===
+MIN_EDGE = 0.08           # 8% minimum edge (proven threshold)
+MAX_PRICE = 0.70          # don't buy above $0.70
+MIN_PRICE = 0.03          # don't buy below $0.03
+MAX_BET = 100.0           # $100 max per trade (Kelly capped)
+MAX_POSITIONS = 20        # max simultaneous positions
+MAX_PER_MARKET = 2        # max positions on same market
+CYCLE_SECONDS = 60        # 60s cycle
 STARTING_BALANCE = 10000.00
-CASH_RESERVE = 0.40       # keep 40% cash
+CASH_RESERVE = 0.30       # keep 30% cash
 TAKER_FEE_RATE = 0.07
 SELL_PROFIT_PCT = 0.50    # take profit at +50%
 
-# Weather series on Kalshi — high temp markets
-# Format: series_prefix -> city_key (matches weather.py CITIES)
-WEATHER_SERIES = {
-    'KXHIGHNY': 'NYC',
-    'KXHIGHCHI': 'CHI',
-    'KXHIGHLA': 'LA',
-    'KXHIGHMIA': 'MIA',
-    'KXHIGHDEN': 'DEN',
-    'KXHIGHATL': 'ATL',
-    'KXHIGHDAL': 'DAL',
-    'KXHIGHSEA': 'SEA',
-    'KXHIGHPHX': 'PHX',
-    'KXHIGHDCA': 'DCA',
+# Circuit breakers
+DAILY_LOSS_LIMIT = 300.0  # stop trading if down $300 today
+MAX_DAILY_TRADES = 50     # max trades per day
+
+# Kalshi weather series prefixes -> station key
+# These map Kalshi ticker prefixes to the NWS station they settle on
+TEMP_SERIES = {
+    'NHIGHNY':  'NYC',   'NHIGHLGA': 'LGA',
+    'NHIGHCHI': 'ORD',   'NHIGHMDW': 'CHI',
+    'NHIGHLA':  'LA',    'NHIGHMIA': 'MIA',
+    'NHIGHDEN': 'DEN',   'NHIGHATL': 'ATL',
+    'NHIGHDFW': 'DFW',   'NHIGHDAL': 'DAL',
+    'NHIGHSEA': 'SEA',   'NHIGHPHX': 'PHX',
+    'NHIGHDCA': 'DCA',   'NHIGHBOS': 'BOS',
+    'NHIGHCLT': 'CLT',   'NHIGHDTW': 'DTW',
+    'NHIGHHOU': 'HOU',   'NHIGHJAX': 'JAX',
+    'NHIGHLAS': 'LAS',   'NHIGHMSP': 'MSP',
+    'NHIGHBNA': 'BNA',   'NHIGHMSY': 'MSY',
+    'NHIGHOKC': 'OKC',   'NHIGHPHL': 'PHL',
+    'NHIGHAUS': 'AUS',   'NHIGHSAT': 'SAT',
+    'NHIGHSFO': 'SFO',   'NHIGHTPA': 'TPA',
+    'NHIGHBKF': 'BKF',
+    # Also try KXHIGH variants
+    'KXHIGHNY':  'NYC',  'KXHIGHLGA': 'LGA',
+    'KXHIGHCHI': 'ORD',  'KXHIGHMDW': 'CHI',
+    'KXHIGHLA':  'LA',   'KXHIGHMIA': 'MIA',
+    'KXHIGHDEN': 'DEN',  'KXHIGHATL': 'ATL',
+    'KXHIGHDFW': 'DFW',  'KXHIGHDAL': 'DAL',
+    'KXHIGHSEA': 'SEA',  'KXHIGHPHX': 'PHX',
+    'KXHIGHDCA': 'DCA',  'KXHIGHBOS': 'BOS',
+    'KXHIGHCLT': 'CLT',  'KXHIGHDTW': 'DTW',
+    'KXHIGHHOU': 'HOU',  'KXHIGHJAX': 'JAX',
+    'KXHIGHLAS': 'LAS',  'KXHIGHMSP': 'MSP',
+    'KXHIGHBNA': 'BNA',  'KXHIGHMSY': 'MSY',
+    'KXHIGHOKC': 'OKC',  'KXHIGHPHL': 'PHL',
+    'KXHIGHAUS': 'AUS',  'KXHIGHSAT': 'SAT',
+    'KXHIGHSFO': 'SFO',  'KXHIGHTPA': 'TPA',
+    'KXHIGHBKF': 'BKF',
 }
 
-# Also track precip/snow series
 PRECIP_SERIES = {
-    'KXRAINY': 'NYC',
-    'KXRAINCHI': 'CHI',
-    'KXRAINLA': 'LA',
+    'KXRAINY': 'NYC', 'KXRAINCHI': 'ORD', 'KXRAINLA': 'LA',
+    'KXRAINMIA': 'MIA', 'KXRAINDEN': 'DEN', 'KXRAINATL': 'ATL',
+    'RAINMNY': 'NYC', 'RAINMCHI': 'ORD', 'RAINMLA': 'LA',
 }
 
 SNOW_SERIES = {
-    'KXSNOWNY': 'NYC',
-    'KXSNOWCHI': 'CHI',
+    'KXSNOWNY': 'NYC', 'KXSNOWCHI': 'ORD', 'KXSNOWBOS': 'BOS',
+    'NOWDATASNOWNY': 'NYC', 'NOWDATASNOWCHI': 'ORD',
 }
 
-ALL_SERIES = list(WEATHER_SERIES.keys()) + list(PRECIP_SERIES.keys()) + list(SNOW_SERIES.keys())
+ALL_SERIES_KEYS = set(list(TEMP_SERIES.keys()) + list(PRECIP_SERIES.keys()) + list(SNOW_SERIES.keys()))
 
 # === DATABASE ===
 
@@ -95,19 +120,21 @@ def init_db():
                     series TEXT,
                     market_type TEXT,
                     city TEXT,
+                    station TEXT,
                     threshold NUMERIC,
                     forecast_value NUMERIC,
                     forecast_prob NUMERIC,
                     edge NUMERIC,
+                    ensemble_size INTEGER,
                     target_date TEXT,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
-            # Add columns if missing (for existing tables)
             for col, typ in [
-                ('market_type', 'TEXT'), ('city', 'TEXT'), ('threshold', 'NUMERIC'),
-                ('forecast_value', 'NUMERIC'), ('forecast_prob', 'NUMERIC'),
-                ('edge', 'NUMERIC'), ('target_date', 'TEXT'),
+                ('market_type', 'TEXT'), ('city', 'TEXT'), ('station', 'TEXT'),
+                ('threshold', 'NUMERIC'), ('forecast_value', 'NUMERIC'),
+                ('forecast_prob', 'NUMERIC'), ('edge', 'NUMERIC'),
+                ('ensemble_size', 'INTEGER'), ('target_date', 'TEXT'),
             ]:
                 try:
                     cur.execute(f"ALTER TABLE trades ADD COLUMN {col} {typ}")
@@ -118,13 +145,30 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS forecasts (
                     id SERIAL PRIMARY KEY,
                     city TEXT,
+                    station TEXT,
                     target_date TEXT,
                     high_f NUMERIC,
                     low_f NUMERIC,
                     precip_mm NUMERIC,
                     snow_cm NUMERIC,
-                    wind_mph NUMERIC,
+                    ensemble_size INTEGER,
                     fetched_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            for col, typ in [('station', 'TEXT'), ('ensemble_size', 'INTEGER')]:
+                try:
+                    cur.execute(f"ALTER TABLE forecasts ADD COLUMN {col} {typ}")
+                except:
+                    pass
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS daily_stats (
+                    id SERIAL PRIMARY KEY,
+                    trade_date DATE DEFAULT CURRENT_DATE,
+                    trades_count INTEGER DEFAULT 0,
+                    daily_pnl NUMERIC DEFAULT 0,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0
                 )
             """)
     finally:
@@ -138,6 +182,9 @@ app = Flask(__name__)
 
 current_forecasts = {}
 current_hot_markets = []
+_daily_trades = 0
+_daily_pnl = 0.0
+_last_trade_date = None
 
 
 def sf(val):
@@ -148,7 +195,6 @@ def sf(val):
 
 
 def kalshi_fee(price, count):
-    """Kalshi taker fee: 7% of P*(1-P) per contract, max $0.02/contract."""
     return min(math.ceil(TAKER_FEE_RATE * count * price * (1 - price) * 100) / 100, 0.02 * count)
 
 
@@ -259,52 +305,75 @@ def get_open_positions():
         conn.close()
 
 
+# === CIRCUIT BREAKERS ===
+
+def check_circuit_breakers():
+    """Check if we should stop trading for the day."""
+    global _daily_trades, _daily_pnl, _last_trade_date
+
+    today = datetime.now(timezone.utc).date()
+    if _last_trade_date != today:
+        _daily_trades = 0
+        _daily_pnl = 0.0
+        _last_trade_date = today
+
+    if _daily_pnl <= -DAILY_LOSS_LIMIT:
+        logger.warning(f"CIRCUIT BREAKER: Daily loss ${_daily_pnl:.2f} exceeds limit ${DAILY_LOSS_LIMIT}")
+        return False
+
+    if _daily_trades >= MAX_DAILY_TRADES:
+        logger.warning(f"CIRCUIT BREAKER: {_daily_trades} trades today, limit is {MAX_DAILY_TRADES}")
+        return False
+
+    return True
+
+
 # === MARKET PARSING ===
 
 def parse_weather_market(ticker, subtitle):
-    """Parse a weather market ticker/subtitle to extract threshold and type.
+    """Parse market ticker to extract type, station, threshold, direction.
 
     Returns (market_type, city_key, threshold, comparison) or None.
-    market_type: 'high_temp', 'precip', 'snow'
-    comparison: 'above' or 'below'
     """
-    # Try high temp series
-    for series_prefix, city_key in WEATHER_SERIES.items():
-        if ticker.startswith(series_prefix):
-            # Extract threshold from ticker or subtitle
-            # Tickers like KXHIGHNY-25MAR28-T55 (temp >= 55F)
-            match = re.search(r'T(\d+)', ticker)
+    ticker_upper = ticker.upper()
+
+    # Temperature markets: NHIGHNY-26MAR25-B58 or KXHIGHNY-26MAR25-T55
+    for series_prefix, city_key in TEMP_SERIES.items():
+        if ticker_upper.startswith(series_prefix):
+            # Extract threshold from ticker
+            # B58 = bracket at 58, T55 = threshold at 55
+            match = re.search(r'[BT](\d+)', ticker_upper)
             if match:
                 threshold = int(match.group(1))
                 return ('high_temp', city_key, threshold, 'above')
 
-            # Try subtitle parsing
-            match = re.search(r'(\d+)', subtitle or '')
+            # Try from subtitle
+            match = re.search(r'(\d+)\s*[°]?\s*[Ff]', subtitle or '')
             if match:
                 threshold = int(match.group(1))
-                # Determine direction from subtitle
-                if 'above' in (subtitle or '').lower() or 'higher' in (subtitle or '').lower() or '>=' in (subtitle or ''):
+                if any(w in (subtitle or '').lower() for w in ['above', 'higher', 'or more', '>=']):
                     return ('high_temp', city_key, threshold, 'above')
-                elif 'below' in (subtitle or '').lower() or 'lower' in (subtitle or '').lower() or '<' in (subtitle or ''):
+                elif any(w in (subtitle or '').lower() for w in ['below', 'lower', 'under', '<']):
                     return ('high_temp', city_key, threshold, 'below')
-                else:
-                    return ('high_temp', city_key, threshold, 'above')
+                return ('high_temp', city_key, threshold, 'above')
 
-    # Try precip series
+    # Precip markets
     for series_prefix, city_key in PRECIP_SERIES.items():
-        if ticker.startswith(series_prefix):
-            return ('precip', city_key, 0.01, 'above')
+        if ticker_upper.startswith(series_prefix):
+            return ('precip', city_key, 0.254, 'above')  # 0.01 inch = 0.254mm
 
-    # Try snow series
+    # Snow markets
     for series_prefix, city_key in SNOW_SERIES.items():
-        if ticker.startswith(series_prefix):
-            return ('snow', city_key, 0.1, 'above')
+        if ticker_upper.startswith(series_prefix):
+            match = re.search(r'(\d+\.?\d*)', subtitle or '')
+            threshold = float(match.group(1)) * 2.54 if match else 2.54  # inches to cm
+            return ('snow', city_key, threshold, 'above')
 
     return None
 
 
 def extract_target_date(market):
-    """Extract the target date for a weather market from close_time or ticker."""
+    """Extract target date from market close_time or ticker."""
     close_time = market.get('close_time') or market.get('expected_expiration_time', '')
     if close_time:
         try:
@@ -313,66 +382,106 @@ def extract_target_date(market):
         except:
             pass
 
-    # Try from ticker: KXHIGHNY-25MAR28-T55
+    # From ticker: NHIGHNY-26MAR25-B58
     match = re.search(r'-(\d{2})([A-Z]{3})(\d{2})-', market.get('ticker', ''))
     if match:
         day, mon, yr = match.groups()
-        months = {'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
-                  'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12}
+        months = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,
+                  'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
         if mon in months:
-            dt = datetime(2000 + int(yr), months[mon], int(day), tzinfo=timezone.utc)
+            dt = datetime(2000+int(yr), months[mon], int(day), tzinfo=timezone.utc)
             return dt.strftime('%Y-%m-%d'), dt
 
     return None, None
 
 
-def get_forecast_for_market(city_key, target_date, market_type):
-    """Look up forecast data for a specific city and date."""
+def get_ensemble_for_date(city_key, target_date):
+    """Get ensemble data for a specific city and date."""
     if city_key not in current_forecasts:
         return None
 
-    for day in current_forecasts[city_key]:
+    fc = current_forecasts[city_key]
+    ensemble = fc.get('ensemble')
+    if not ensemble:
+        return None
+
+    for day in ensemble.get('daily', []):
         if day['date'] == target_date:
             return day
 
     return None
 
 
-def compute_edge(market_type, comparison, forecast_day, threshold, days_out):
-    """Compute our probability estimate and the edge vs market.
+def get_deterministic_for_date(city_key, target_date):
+    """Get deterministic forecast for a specific city and date."""
+    if city_key not in current_forecasts:
+        return None
 
-    Returns (our_prob, forecast_value) where our_prob is for 'yes' outcome.
+    for day in current_forecasts[city_key].get('deterministic', []):
+        if day['date'] == target_date:
+            return day
+
+    return None
+
+
+def compute_probability(market_type, comparison, city_key, target_date, threshold, days_out):
+    """Compute probability using ensemble (preferred) or Gaussian fallback.
+
+    Returns (probability_for_yes, forecast_value, ensemble_size)
     """
-    if not forecast_day:
-        return None, None
+    ensemble_day = get_ensemble_for_date(city_key, target_date)
+    det_day = get_deterministic_for_date(city_key, target_date)
 
     if market_type == 'high_temp':
-        forecast_val = forecast_day.get('high_f')
-        if forecast_val is None:
-            return None, None
+        if ensemble_day and len(ensemble_day.get('highs', [])) > 1:
+            highs = ensemble_day['highs']
+            if comparison == 'above':
+                prob = ensemble_prob_above(highs, threshold)
+            else:
+                prob = ensemble_prob_below(highs, threshold)
+            mean_high = sum(highs) / len(highs)
+            return prob, mean_high, len(highs)
 
-        if comparison == 'above':
-            prob = estimate_prob_above(forecast_val, threshold, days_out)
-        else:
-            prob = estimate_prob_below(forecast_val, threshold, days_out)
-        return prob, forecast_val
+        # Gaussian fallback
+        if det_day and det_day.get('high_f') is not None:
+            forecast = det_day['high_f']
+            if comparison == 'above':
+                prob = gaussian_prob_above(forecast, threshold, days_out)
+            else:
+                prob = 1.0 - gaussian_prob_above(forecast, threshold, days_out)
+            return prob, forecast, 1
 
     elif market_type == 'precip':
-        forecast_val = forecast_day.get('precip_mm', 0)
-        prob = estimate_precip_prob(forecast_val, threshold)
-        return prob, forecast_val
+        if ensemble_day and len(ensemble_day.get('precip_sums', [])) > 1:
+            precips = ensemble_day['precip_sums']
+            prob = estimate_precip_prob(precips, threshold)
+            mean_precip = sum(precips) / len(precips)
+            return prob, mean_precip, len(precips)
+
+        if det_day:
+            val = det_day.get('precip_mm', 0)
+            prob = estimate_precip_prob([val], threshold)
+            return prob, val, 1
 
     elif market_type == 'snow':
-        forecast_val = forecast_day.get('snow_cm', 0)
-        prob = estimate_snow_prob(forecast_val, threshold)
-        return prob, forecast_val
+        if ensemble_day and len(ensemble_day.get('snow_sums', [])) > 1:
+            snows = ensemble_day['snow_sums']
+            prob = estimate_snow_prob(snows, threshold)
+            mean_snow = sum(snows) / len(snows)
+            return prob, mean_snow, len(snows)
 
-    return None, None
+        if det_day:
+            val = det_day.get('snow_cm', 0)
+            prob = estimate_snow_prob([val], threshold)
+            return prob, val, 1
+
+    return None, None, 0
 
 
 # === SELL LOGIC ===
 
 def check_sells():
+    global _daily_pnl
     logger.info("--- SELL CHECK ---")
     open_positions = get_open_positions()
 
@@ -405,11 +514,12 @@ def check_sells():
             buy_fee = kalshi_fee(entry_price, count)
             if result_val == side:
                 pnl = round((1.0 - entry_price) * count - buy_fee, 4)
-                reason = "WIN settled @$1.00"
+                reason = "WIN"
             else:
                 pnl = round(-entry_price * count - buy_fee, 4)
-                reason = "LOSS settled"
+                reason = "LOSS"
             logger.info(f"SETTLED: {ticker} {side} | {reason} | pnl=${pnl:.4f}")
+            _daily_pnl += pnl
             conn = get_db()
             try:
                 with conn.cursor() as cur:
@@ -421,9 +531,7 @@ def check_sells():
             expired += 1
             continue
 
-        # === CLOSED but no result ===
         if status in ('closed', 'settled', 'finalized'):
-            logger.info(f"WAITING: {ticker} status={status}, no result yet")
             continue
 
         # Get current bid
@@ -432,7 +540,6 @@ def check_sells():
         else:
             current_bid = sf(market.get('no_bid_dollars', '0'))
 
-        # Update bid in DB
         conn = get_db()
         try:
             with conn.cursor() as cur:
@@ -446,17 +553,12 @@ def check_sells():
             continue
 
         gain = (current_bid - entry_price) / entry_price
-
         logger.info(f"  POS: {ticker} {side} entry=${entry_price:.2f} bid=${current_bid:.2f} {gain*100:+.0f}% x{count}")
 
-        # Take profit
         if gain >= SELL_PROFIT_PCT:
             buy_fee = kalshi_fee(entry_price, count)
             sell_fee = kalshi_fee(current_bid, count)
-            gross = round((current_bid - entry_price) * count, 4)
-            pnl = round(gross - buy_fee - sell_fee, 4)
-
-            logger.info(f"SELL: {ticker} {side} x{count} @ ${current_bid:.2f} | pnl=${pnl:.4f}")
+            pnl = round((current_bid - entry_price) * count - buy_fee - sell_fee, 4)
 
             result = place_order(ticker, side, 'sell', current_bid, count)
             if not result:
@@ -466,6 +568,7 @@ def check_sells():
             if filled < count:
                 pnl = round((current_bid - entry_price) * filled - kalshi_fee(entry_price, filled) - kalshi_fee(current_bid, filled), 4)
 
+            _daily_pnl += pnl
             conn = get_db()
             try:
                 with conn.cursor() as cur:
@@ -477,7 +580,7 @@ def check_sells():
                 conn.close()
             sold += 1
 
-    logger.info(f"SELL SUMMARY: sold={sold} expired={expired}")
+    logger.info(f"SELL SUMMARY: sold={sold} settled={expired}")
 
 
 # === BUY LOGIC ===
@@ -485,7 +588,11 @@ def check_sells():
 def fetch_weather_markets():
     """Fetch all open weather markets from Kalshi."""
     all_markets = []
-    for series in ALL_SERIES:
+    fetched_series = set()
+
+    for series in ALL_SERIES_KEYS:
+        if series in fetched_series:
+            continue
         cursor = None
         try:
             while True:
@@ -498,20 +605,28 @@ def fetch_weather_markets():
                 cursor = resp.get('cursor')
                 if not cursor or not batch:
                     break
+            fetched_series.add(series)
         except Exception as e:
-            logger.error(f"Fetch {series} failed: {e}")
-    logger.info(f"Fetched {len(all_markets)} weather markets from {len(ALL_SERIES)} series")
+            if '404' not in str(e) and 'not found' not in str(e).lower():
+                logger.error(f"Fetch {series} failed: {e}")
+
+    logger.info(f"Fetched {len(all_markets)} weather markets from {len(fetched_series)} series")
     return all_markets
 
 
 def buy_candidates(markets):
-    """Find and buy mispriced weather markets using forecast edge."""
+    """Find and buy mispriced weather markets using ensemble edge."""
+    global _daily_trades
+
+    if not check_circuit_breakers():
+        return
+
     balance = get_balance()
     open_positions = get_open_positions()
     logger.info(f"Balance: ${balance:.2f} | {len(open_positions)} positions open")
 
     if len(open_positions) >= MAX_POSITIONS:
-        logger.info(f"At max positions ({MAX_POSITIONS}), skipping buys")
+        logger.info(f"At max positions ({MAX_POSITIONS})")
         return
 
     deployable = balance * (1.0 - CASH_RESERVE)
@@ -520,9 +635,7 @@ def buy_candidates(markets):
         return
 
     now = datetime.now(timezone.utc)
-    today = now.strftime('%Y-%m-%d')
 
-    # Count positions per ticker
     ticker_counts = {}
     for t in open_positions:
         tk = t.get('ticker', '')
@@ -534,54 +647,44 @@ def buy_candidates(markets):
         ticker = market.get('ticker', '')
         subtitle = market.get('subtitle', '') or market.get('title', '')
 
-        # Parse market type
         parsed = parse_weather_market(ticker, subtitle)
         if not parsed:
             continue
 
         market_type, city_key, threshold, comparison = parsed
 
-        # Position cap per ticker
         if ticker_counts.get(ticker, 0) >= MAX_PER_MARKET:
             continue
 
-        # Get target date
         target_date, target_dt = extract_target_date(market)
         if not target_date or not target_dt:
             continue
 
-        # How many days out
         days_out = max(0, (target_dt.date() - now.date()).days)
         if days_out > 6:
-            continue  # forecast unreliable beyond 7 days
-
-        # Get forecast
-        forecast_day = get_forecast_for_market(city_key, target_date, market_type)
-        if not forecast_day:
             continue
 
-        # Compute our probability
-        our_prob, forecast_val = compute_edge(market_type, comparison, forecast_day, threshold, days_out)
+        our_prob, forecast_val, ensemble_size = compute_probability(
+            market_type, comparison, city_key, target_date, threshold, days_out
+        )
         if our_prob is None:
             continue
 
-        # Get market prices
         yes_ask = float(market.get('yes_ask_dollars') or '999')
         no_ask = float(market.get('no_ask_dollars') or '999')
 
-        # Decide which side to buy
-        # If we think yes prob is high and yes is cheap -> buy yes
-        # If we think yes prob is low (no prob is high) and no is cheap -> buy no
         best_side = None
         best_price = None
         best_edge = 0
+        best_prob = 0
 
         if MIN_PRICE <= yes_ask <= MAX_PRICE:
-            edge_yes = our_prob - yes_ask  # yes_ask is like the market's yes probability
+            edge_yes = our_prob - yes_ask
             if edge_yes >= MIN_EDGE:
                 best_side = 'yes'
                 best_price = yes_ask
                 best_edge = edge_yes
+                best_prob = our_prob
 
         if MIN_PRICE <= no_ask <= MAX_PRICE:
             no_prob = 1.0 - our_prob
@@ -590,44 +693,61 @@ def buy_candidates(markets):
                 best_side = 'no'
                 best_price = no_ask
                 best_edge = edge_no
+                best_prob = no_prob
 
         if not best_side:
             continue
+
+        # Kelly sizing
+        contracts = kelly_size(best_prob, best_price, balance, MAX_BET)
+        if contracts <= 0:
+            continue
+
+        station_info = STATIONS.get(city_key, (0, 0, city_key, '', ''))
 
         candidates.append({
             'ticker': ticker,
             'side': best_side,
             'price': best_price,
             'edge': best_edge,
-            'our_prob': our_prob if best_side == 'yes' else 1.0 - our_prob,
+            'our_prob': best_prob,
+            'contracts': contracts,
             'market_type': market_type,
             'city': city_key,
+            'station': station_info[3] if len(station_info) > 3 else '',
             'threshold': threshold,
             'forecast_value': forecast_val,
             'target_date': target_date,
             'days_out': days_out,
+            'ensemble_size': ensemble_size,
         })
 
-    # Sort by edge (highest first)
-    candidates.sort(key=lambda x: x['edge'], reverse=True)
-    logger.info(f"Found {len(candidates)} edge candidates (min edge {MIN_EDGE*100:.0f}%)")
+    # Sort by edge * ensemble confidence
+    candidates.sort(key=lambda x: x['edge'] * (1.0 if x['ensemble_size'] > 1 else 0.7), reverse=True)
+    logger.info(f"Found {len(candidates)} edge candidates (>={MIN_EDGE*100:.0f}%)")
 
     bought = 0
     for c in candidates:
         if len(open_positions) + bought >= MAX_POSITIONS:
             break
+        if not check_circuit_breakers():
+            break
 
-        cost = c['price'] * CONTRACTS
+        cost = c['price'] * c['contracts']
         if cost > deployable:
-            continue
+            c['contracts'] = max(1, int(deployable / c['price']))
+            cost = c['price'] * c['contracts']
+            if cost > deployable:
+                continue
 
         logger.info(
-            f"EDGE: {c['ticker']} {c['side']} @ ${c['price']:.2f} | "
-            f"forecast={c['forecast_value']:.1f} prob={c['our_prob']:.2f} edge={c['edge']:.2f} | "
-            f"{c['city']} {c['market_type']} thresh={c['threshold']} date={c['target_date']}"
+            f"EDGE: {c['ticker']} {c['side']} x{c['contracts']} @ ${c['price']:.2f} | "
+            f"prob={c['our_prob']:.2f} edge={c['edge']:.2f} ensemble={c['ensemble_size']} | "
+            f"{c['city']}({c['station']}) {c['market_type']} thresh={c['threshold']} "
+            f"forecast={c['forecast_value']:.1f} date={c['target_date']}"
         )
 
-        result = place_order(c['ticker'], c['side'], 'buy', c['price'], CONTRACTS)
+        result = place_order(c['ticker'], c['side'], 'buy', c['price'], c['contracts'])
         if not result:
             continue
 
@@ -640,12 +760,14 @@ def buy_candidates(markets):
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO trades
-                       (ticker, side, action, price, count, current_bid, series, market_type, city,
-                        threshold, forecast_value, forecast_prob, edge, target_date)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (c['ticker'], c['side'], 'buy', float(c['price']), filled, float(c['price']),
-                     '', c['market_type'], c['city'], float(c['threshold']),
-                     float(c['forecast_value']), float(c['our_prob']), float(c['edge']),
+                       (ticker, side, action, price, count, current_bid, series,
+                        market_type, city, station, threshold, forecast_value,
+                        forecast_prob, edge, ensemble_size, target_date)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (c['ticker'], c['side'], 'buy', float(c['price']), filled,
+                     float(c['price']), '', c['market_type'], c['city'], c['station'],
+                     float(c['threshold']), float(c['forecast_value']),
+                     float(c['our_prob']), float(c['edge']), c['ensemble_size'],
                      c['target_date'])
                 )
         except Exception as e:
@@ -655,15 +777,15 @@ def buy_candidates(markets):
 
         deployable -= cost
         bought += 1
+        _daily_trades += 1
 
-    logger.info(f"Bought {bought} positions")
+    logger.info(f"Bought {bought} positions (Kelly sized)")
 
 
 def update_hot_markets(markets):
-    """Track most active weather markets."""
     global current_hot_markets
     active = [m for m in markets if sf(m.get('yes_ask_dollars', '0')) < 0.99]
-    by_vol = sorted(active, key=lambda m: int(m.get('volume', 0) or 0), reverse=True)[:10]
+    by_vol = sorted(active, key=lambda m: int(m.get('volume', 0) or 0), reverse=True)[:15]
     current_hot_markets = [
         {
             'ticker': m.get('ticker', ''),
@@ -690,24 +812,35 @@ def run_cycle():
 
     # Refresh forecasts every 10 cycles (~10 min)
     if _cycle_count % 10 == 1 or not current_forecasts:
-        logger.info("Fetching weather forecasts...")
+        logger.info("Fetching GFS ensemble forecasts for all stations...")
         current_forecasts = fetch_all_forecasts()
-        for city, days in current_forecasts.items():
-            if days:
-                d = days[0]
-                logger.info(f"  {city}: high={d.get('high_f', '?')}F low={d.get('low_f', '?')}F precip={d.get('precip_mm', 0):.1f}mm")
+        ensemble_count = sum(1 for v in current_forecasts.values()
+                           if v.get('ensemble') and v['ensemble'].get('daily')
+                           and v['ensemble']['daily'][0].get('highs')
+                           and len(v['ensemble']['daily'][0]['highs']) > 1)
+        logger.info(f"Ensemble data for {ensemble_count}/{len(current_forecasts)} stations")
+        for city, fc in current_forecasts.items():
+            det = fc.get('deterministic', [{}])
+            if det:
+                d = det[0]
+                station = STATIONS.get(city, (0, 0, city, '', ''))[3]
+                ens_size = d.get('ensemble_size', 0)
+                logger.info(f"  {city}({station}): high={d.get('high_f', '?')}F "
+                          f"low={d.get('low_f', '?')}F precip={d.get('precip_mm', 0):.1f}mm "
+                          f"ensemble={ens_size}")
 
-        # Save forecasts to DB
+        # Save to DB
         conn = get_db()
         try:
             with conn.cursor() as cur:
-                for city, days in current_forecasts.items():
-                    for d in days:
+                for city, fc in current_forecasts.items():
+                    station = STATIONS.get(city, (0, 0, city, '', ''))[3]
+                    for d in fc.get('deterministic', []):
                         cur.execute(
-                            """INSERT INTO forecasts (city, target_date, high_f, low_f, precip_mm, snow_cm, wind_mph)
-                               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                            (city, d['date'], d.get('high_f'), d.get('low_f'),
-                             d.get('precip_mm', 0), d.get('snow_cm', 0), d.get('wind_mph', 0))
+                            """INSERT INTO forecasts (city, station, target_date, high_f, low_f, precip_mm, snow_cm, ensemble_size)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                            (city, station, d['date'], d.get('high_f'), d.get('low_f'),
+                             d.get('precip_mm', 0), d.get('snow_cm', 0), d.get('ensemble_size', 0))
                         )
         except Exception as e:
             logger.error(f"Save forecasts failed: {e}")
@@ -720,10 +853,10 @@ def run_cycle():
     buy_candidates(markets)
 
     balance = get_balance()
-    logger.info(f"=== CYCLE END [{mode}] === Balance: ${balance:.2f}")
+    logger.info(f"=== CYCLE END [{mode}] === Balance: ${balance:.2f} | Daily P&L: ${_daily_pnl:.2f}")
 
 
-# === DASHBOARD API ===
+# === DASHBOARD ===
 
 @app.route('/')
 def health():
@@ -742,30 +875,41 @@ def api_status():
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT pnl, count FROM trades WHERE action = 'buy' AND pnl IS NOT NULL")
-                resolved_data = cur.fetchall()
-
+                resolved = cur.fetchall()
                 cur.execute("SELECT count, price FROM trades WHERE action = 'buy'")
                 all_buys = cur.fetchall()
         finally:
             conn.close()
 
-        total_pnl = sum(sf(t['pnl']) for t in resolved_data)
-        wins = sum(1 for t in resolved_data if sf(t['pnl']) > 0)
-        losses = sum(1 for t in resolved_data if sf(t['pnl']) <= 0)
-        avg_win = round(sum(sf(t['pnl']) for t in resolved_data if sf(t['pnl']) > 0) / max(wins, 1), 4)
-        avg_loss = round(sum(sf(t['pnl']) for t in resolved_data if sf(t['pnl']) <= 0) / max(losses, 1), 4)
-
+        total_pnl = sum(sf(t['pnl']) for t in resolved)
+        wins = sum(1 for t in resolved if sf(t['pnl']) > 0)
+        losses = sum(1 for t in resolved if sf(t['pnl']) <= 0)
+        avg_win = round(sum(sf(t['pnl']) for t in resolved if sf(t['pnl']) > 0) / max(wins, 1), 4)
+        avg_loss = round(sum(sf(t['pnl']) for t in resolved if sf(t['pnl']) <= 0) / max(losses, 1), 4)
         total_contracts = sum((t.get('count') or 1) for t in all_buys)
-        total_fees = sum(kalshi_fee(sf(t.get('price')), t.get('count') or 1) for t in all_buys)
+        total_fees = round(sum(kalshi_fee(sf(t.get('price')), t.get('count') or 1) for t in all_buys), 4)
 
-        # Unrealized P&L
         round_cost = sum(sf(t.get('price')) * (t.get('count') or 1) for t in open_positions)
         round_pnl = round(positions_value - round_cost, 4)
         round_pct = round((round_pnl / round_cost * 100), 1) if round_cost > 0 else 0
-
         overall_pnl = round((cash + positions_value) - STARTING_BALANCE, 2)
 
         mode = "PAPER" if not ENABLE_TRADING else "LIVE"
+
+        # Edge accuracy
+        conn = get_db()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""SELECT edge, ensemble_size, pnl FROM trades
+                              WHERE action='buy' AND pnl IS NOT NULL AND edge IS NOT NULL
+                              ORDER BY created_at DESC LIMIT 100""")
+                edge_trades = cur.fetchall()
+        finally:
+            conn.close()
+
+        edge_wins = sum(1 for t in edge_trades if sf(t['pnl']) > 0)
+        edge_total = len(edge_trades)
+        avg_edge = round(sum(sf(t['edge']) for t in edge_trades) / max(edge_total, 1) * 100, 1)
 
         return jsonify({
             'portfolio': round(portfolio, 2),
@@ -775,7 +919,7 @@ def api_status():
             'round_pnl': round_pnl,
             'round_pct': round_pct,
             'net_pnl': round(total_pnl, 4),
-            'total_fees': round(total_fees, 4),
+            'total_fees': total_fees,
             'total_contracts': total_contracts,
             'wins': wins,
             'losses': losses,
@@ -784,11 +928,17 @@ def api_status():
             'avg_win': avg_win,
             'avg_loss': avg_loss,
             'cities_tracked': len(current_forecasts),
+            'stations_total': len(STATIONS),
+            'daily_pnl': round(_daily_pnl, 2),
+            'daily_trades': _daily_trades,
+            'edge_accuracy': round(edge_wins / max(edge_total, 1) * 100, 1),
+            'avg_edge': avg_edge,
+            'edge_sample': edge_total,
+            'cycle': _cycle_count,
         })
     except Exception as e:
         logger.error(f"API status error: {e}")
-        return jsonify({'portfolio': 0, 'cash': 0, 'positions_value': 0, 'net_pnl': 0,
-                        'wins': 0, 'losses': 0, 'open_count': 0, 'mode': 'PAPER'})
+        return jsonify({'portfolio': 0, 'cash': 0, 'mode': 'PAPER'})
 
 
 @app.route('/api/open')
@@ -805,10 +955,12 @@ def api_open():
                 'ticker': t.get('ticker', ''),
                 'side': t.get('side', ''),
                 'city': t.get('city', ''),
+                'station': t.get('station', ''),
                 'market_type': t.get('market_type', ''),
                 'threshold': sf(t.get('threshold')),
                 'forecast_value': sf(t.get('forecast_value')),
                 'edge': sf(t.get('edge')),
+                'ensemble_size': t.get('ensemble_size', 0),
                 'target_date': t.get('target_date', ''),
                 'count': count,
                 'entry': price,
@@ -829,7 +981,8 @@ def api_trades():
         conn = get_db()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM trades WHERE action = 'buy' AND pnl IS NOT NULL ORDER BY created_at DESC LIMIT 50")
+                cur.execute("""SELECT * FROM trades WHERE action='buy' AND pnl IS NOT NULL
+                              ORDER BY created_at DESC LIMIT 50""")
                 result_data = cur.fetchall()
         finally:
             conn.close()
@@ -843,8 +996,10 @@ def api_trades():
                 'ticker': t.get('ticker', ''),
                 'side': t.get('side', ''),
                 'city': t.get('city', ''),
+                'station': t.get('station', ''),
                 'market_type': t.get('market_type', ''),
                 'edge': sf(t.get('edge')),
+                'ensemble_size': t.get('ensemble_size', 0),
                 'count': t.get('count', 1),
                 'entry': entry,
                 'exit': exit_price,
@@ -864,61 +1019,84 @@ def api_hot():
 
 @app.route('/api/forecasts')
 def api_forecasts():
-    """Return current forecast data for all cities."""
     result = {}
-    for city_key, days in current_forecasts.items():
-        city_name = CITIES.get(city_key, (0, 0, city_key))[2]
+    for city_key, fc in current_forecasts.items():
+        info = STATIONS.get(city_key, (0, 0, city_key, '', ''))
+        det = fc.get('deterministic', [])[:3]
+        ensemble = fc.get('ensemble')
+        ens_size = 0
+        if ensemble and ensemble.get('daily'):
+            ens_size = len(ensemble['daily'][0].get('highs', []))
         result[city_key] = {
-            'name': city_name,
-            'forecasts': days[:3],  # next 3 days
+            'name': info[2],
+            'station': info[3] if len(info) > 3 else '',
+            'station_name': info[4] if len(info) > 4 else '',
+            'lat': info[0],
+            'lon': info[1],
+            'ensemble_size': ens_size,
+            'forecasts': det,
         }
     return jsonify(result)
 
 
-@app.route('/api/edge_history')
-def api_edge_history():
-    """Show historical accuracy of edge calls."""
+@app.route('/api/edge_stats')
+def api_edge_stats():
     try:
         conn = get_db()
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT city, market_type, edge, forecast_prob, pnl,
-                           CASE WHEN pnl > 0 THEN 1 ELSE 0 END as won
-                    FROM trades
-                    WHERE action = 'buy' AND pnl IS NOT NULL AND edge IS NOT NULL
+                    SELECT city, station, market_type, edge, ensemble_size, forecast_prob, pnl
+                    FROM trades WHERE action='buy' AND pnl IS NOT NULL AND edge IS NOT NULL
                     ORDER BY created_at DESC LIMIT 200
                 """)
                 trades = cur.fetchall()
         finally:
             conn.close()
 
-        # Bucket by edge size
-        buckets = {}
+        # By edge bucket
+        edge_buckets = {}
         for t in trades:
             edge = sf(t.get('edge'))
-            if edge < 0.20:
-                b = '15-20%'
-            elif edge < 0.30:
-                b = '20-30%'
-            elif edge < 0.50:
-                b = '30-50%'
-            else:
-                b = '50%+'
-            if b not in buckets:
-                buckets[b] = {'total': 0, 'wins': 0, 'pnl': 0}
-            buckets[b]['total'] += 1
-            buckets[b]['wins'] += int(sf(t.get('pnl')) > 0)
-            buckets[b]['pnl'] += sf(t.get('pnl'))
+            if edge < 0.10: b = '8-10%'
+            elif edge < 0.15: b = '10-15%'
+            elif edge < 0.25: b = '15-25%'
+            elif edge < 0.40: b = '25-40%'
+            else: b = '40%+'
+            if b not in edge_buckets:
+                edge_buckets[b] = {'total': 0, 'wins': 0, 'pnl': 0}
+            edge_buckets[b]['total'] += 1
+            edge_buckets[b]['wins'] += int(sf(t.get('pnl')) > 0)
+            edge_buckets[b]['pnl'] += sf(t.get('pnl'))
+
+        # By city
+        city_stats = {}
+        for t in trades:
+            city = t.get('city', '?')
+            if city not in city_stats:
+                city_stats[city] = {'total': 0, 'wins': 0, 'pnl': 0}
+            city_stats[city]['total'] += 1
+            city_stats[city]['wins'] += int(sf(t.get('pnl')) > 0)
+            city_stats[city]['pnl'] += sf(t.get('pnl'))
+
+        # Ensemble vs deterministic
+        ens_trades = [t for t in trades if (t.get('ensemble_size') or 0) > 1]
+        det_trades = [t for t in trades if (t.get('ensemble_size') or 0) <= 1]
+        ens_wr = round(sum(1 for t in ens_trades if sf(t['pnl']) > 0) / max(len(ens_trades), 1) * 100, 1)
+        det_wr = round(sum(1 for t in det_trades if sf(t['pnl']) > 0) / max(len(det_trades), 1) * 100, 1)
 
         return jsonify({
-            'buckets': {k: {**v, 'win_rate': round(v['wins'] / v['total'] * 100, 1) if v['total'] > 0 else 0}
-                        for k, v in buckets.items()},
-            'total_trades': len(trades),
+            'edge_buckets': {k: {**v, 'wr': round(v['wins']/max(v['total'],1)*100, 1),
+                                  'pnl': round(v['pnl'], 2)} for k, v in edge_buckets.items()},
+            'city_stats': {k: {**v, 'wr': round(v['wins']/max(v['total'],1)*100, 1),
+                                'pnl': round(v['pnl'], 2)} for k, v in city_stats.items()},
+            'ensemble_wr': ens_wr, 'ensemble_n': len(ens_trades),
+            'deterministic_wr': det_wr, 'deterministic_n': len(det_trades),
+            'total': len(trades),
         })
     except Exception as e:
-        logger.error(f"API edge history error: {e}")
-        return jsonify({'buckets': {}, 'total_trades': 0})
+        logger.error(f"API edge stats error: {e}")
+        return jsonify({})
 
 
 @app.route('/dashboard')
@@ -931,220 +1109,344 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Kalshi Weather Terminal</title>
+<title>Weather Edge Terminal</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&display=swap');
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --bg:#06080d;--bg1:#0c1017;--bg2:#111820;--bg3:#1a2130;
-  --border:#1a2235;--border2:#243050;
-  --text:#c8d0e0;--text2:#6a7490;--text3:#3a4260;
-  --green:#00e68a;--green2:#00cc7a;--green-bg:rgba(0,230,138,.06);
-  --red:#ff4466;--red2:#ee3355;--red-bg:rgba(255,68,102,.06);
-  --gold:#f0b040;--gold2:#e0a030;
-  --blue:#4488ff;--cyan:#40d0e0;
-  --sky:#60b0ff;
+  --bg:#050810;--bg1:#0a0f1a;--bg2:#101828;--bg3:#182030;
+  --border:#152035;--border2:#1e3050;
+  --text:#c8d4e8;--text2:#5a6a8a;--text3:#354060;
+  --green:#00f090;--green2:#00d880;--green-glow:rgba(0,240,144,.15);
+  --red:#ff3860;--red2:#e83050;--red-glow:rgba(255,56,96,.15);
+  --gold:#ffc040;--gold-glow:rgba(255,192,64,.12);
+  --blue:#3890ff;--cyan:#30d8f0;--purple:#8060ff;
+  --sky:#50b8ff;--sky-glow:rgba(80,184,255,.1);
+  --orange:#ff8030;
 }
-body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.5;min-height:100vh;display:flex;flex-direction:column}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.5;min-height:100vh;display:flex;flex-direction:column;overflow-x:hidden}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:var(--bg1)}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--text3)}
 
-.header-bar{background:var(--bg1);border-bottom:1px solid var(--border);padding:10px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
-.header-left{display:flex;align-items:center;gap:16px}
-.brand{font-size:13px;font-weight:700;color:var(--sky);letter-spacing:2px;text-transform:uppercase}
-.live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;animation:pulse 1.8s ease-in-out infinite}
-.dot-paper{background:var(--gold);box-shadow:0 0 8px var(--gold)}
-.dot-live{background:var(--green);box-shadow:0 0 8px var(--green)}
-.mode-badge{font-size:10px;padding:3px 10px;border-radius:3px;font-weight:600;letter-spacing:1px}
-.mode-paper{background:rgba(240,176,64,.15);color:var(--gold);border:1px solid rgba(240,176,64,.3)}
-.mode-live{background:rgba(0,230,138,.15);color:var(--green);border:1px solid rgba(0,230,138,.3)}
-.header-right{display:flex;align-items:center;gap:16px;font-size:10px;color:var(--text2)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+@keyframes glow{0%,100%{box-shadow:0 0 15px var(--sky-glow)}50%{box-shadow:0 0 30px var(--sky-glow),0 0 60px rgba(80,184,255,.05)}}
+@keyframes slideUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
 
-.main-wrap{flex:1;padding:16px 20px;max-width:1600px;margin:0 auto;width:100%}
+/* === HEADER === */
+.header{background:linear-gradient(180deg,var(--bg1) 0%,var(--bg) 100%);border-bottom:1px solid var(--border);padding:12px 28px;display:flex;align-items:center;justify-content:space-between;position:relative}
+.header::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--sky),var(--purple),var(--sky),transparent);opacity:.4}
+.h-left{display:flex;align-items:center;gap:14px}
+.brand{font-size:14px;font-weight:800;background:linear-gradient(135deg,var(--sky),var(--cyan),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:2px;text-transform:uppercase}
+.brand-sub{font-size:9px;color:var(--text3);letter-spacing:3px;text-transform:uppercase;margin-top:-2px}
+.live-dot{width:8px;height:8px;border-radius:50%;animation:pulse 2s ease infinite}
+.dot-paper{background:var(--gold);box-shadow:0 0 10px var(--gold)}
+.dot-live{background:var(--green);box-shadow:0 0 10px var(--green)}
+.mode-badge{font-size:9px;padding:3px 10px;border-radius:3px;font-weight:700;letter-spacing:1.5px}
+.mode-paper{background:rgba(255,192,64,.1);color:var(--gold);border:1px solid rgba(255,192,64,.25)}
+.mode-live{background:rgba(0,240,144,.1);color:var(--green);border:1px solid rgba(0,240,144,.25)}
+.h-right{display:flex;align-items:center;gap:20px;font-size:10px;color:var(--text2)}
+.h-right .sep{color:var(--border2)}
+.h-pill{background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-size:9px}
+
+/* === MAIN === */
+.main{flex:1;padding:16px 24px;max-width:1800px;margin:0 auto;width:100%}
+
+/* === HERO === */
+.hero{background:var(--bg1);border:1px solid var(--border);border-radius:10px;padding:28px 36px;text-align:center;margin-bottom:16px;position:relative;overflow:hidden;animation:glow 4s ease infinite}
+.hero::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--sky),var(--cyan),var(--purple),var(--sky),transparent)}
+.hero-label{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:3px;margin-bottom:8px}
+.hero-val{font-size:48px;font-weight:800;letter-spacing:-2px;line-height:1}
+.hero-row{display:flex;justify-content:center;gap:40px;margin-top:18px;flex-wrap:wrap}
+.hero-item{text-align:center}
+.hero-item-label{font-size:8px;color:var(--text3);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:3px}
+.hero-item-val{font-size:16px;font-weight:700}
+
+/* === STATS GRID === */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:16px}
+.stat{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:14px 16px;position:relative;overflow:hidden;transition:border-color .3s}
+.stat:hover{border-color:var(--border2)}
+.stat::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px;border-radius:0 0 8px 8px}
+.stat.a-green::after{background:linear-gradient(90deg,transparent,var(--green),transparent)}
+.stat.a-red::after{background:linear-gradient(90deg,transparent,var(--red),transparent)}
+.stat.a-sky::after{background:linear-gradient(90deg,transparent,var(--sky),transparent)}
+.stat.a-gold::after{background:linear-gradient(90deg,transparent,var(--gold),transparent)}
+.stat.a-purple::after{background:linear-gradient(90deg,transparent,var(--purple),transparent)}
+.stat.a-cyan::after{background:linear-gradient(90deg,transparent,var(--cyan),transparent)}
+.stat.a-orange::after{background:linear-gradient(90deg,transparent,var(--orange),transparent)}
+.s-label{font-size:8px;color:var(--text3);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:5px}
+.s-val{font-size:17px;font-weight:700}
+
+/* === GRID === */
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-@media(max-width:1100px){.grid{grid-template-columns:1fr}}
+@media(max-width:1200px){.grid{grid-template-columns:1fr}}
 .full{grid-column:1/-1}
+.triple{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+@media(max-width:1200px){.triple{grid-template-columns:1fr}}
 
-.hero-card{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:24px 32px;text-align:center;position:relative;overflow:hidden;margin-bottom:14px}
-.hero-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--sky),transparent)}
-.hero-label{font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:2px;margin-bottom:6px}
-.hero-value{font-size:40px;font-weight:800;letter-spacing:-1px}
-.hero-sub{display:flex;justify-content:center;gap:32px;margin-top:14px;flex-wrap:wrap}
-.hero-sub-item{text-align:center}
-.hero-sub-label{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1px}
-.hero-sub-value{font-size:15px;font-weight:600;margin-top:2px}
+/* === PANEL === */
+.panel{background:var(--bg1);border:1px solid var(--border);border-radius:10px;overflow:hidden;animation:slideUp .4s ease}
+.p-head{padding:12px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:linear-gradient(180deg,var(--bg2),var(--bg1))}
+.p-head h2{font-size:11px;text-transform:uppercase;letter-spacing:2px;font-weight:700;display:flex;align-items:center;gap:8px}
+.p-head h2 .icon{font-size:14px}
+.p-head .badge{font-size:9px;color:var(--text2);background:var(--bg);padding:2px 8px;border-radius:3px;border:1px solid var(--border)}
+.p-body{max-height:420px;overflow-y:auto}
 
-.stats-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:14px}
-.stat-card{background:var(--bg1);border:1px solid var(--border);border-radius:6px;padding:12px 14px;position:relative;overflow:hidden}
-.stat-card::after{content:'';position:absolute;bottom:0;left:0;right:0;height:1px}
-.stat-card.a-green::after{background:var(--green)}.stat-card.a-red::after{background:var(--red)}.stat-card.a-sky::after{background:var(--sky)}.stat-card.a-gold::after{background:var(--gold)}
-.stat-label{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
-.stat-value{font-size:15px;font-weight:700}
-
-.panel{background:var(--bg1);border:1px solid var(--border);border-radius:8px;overflow:hidden}
-.panel-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--bg2)}
-.panel-header h2{color:var(--sky);font-size:11px;text-transform:uppercase;letter-spacing:1.5px;font-weight:600}
-.panel-header .count{color:var(--text2);font-size:10px}
-.panel-body{max-height:380px;overflow-y:auto}
-.panel-body::-webkit-scrollbar{width:4px}
-.panel-body::-webkit-scrollbar-track{background:var(--bg1)}
-.panel-body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
-
+/* === TABLES === */
 table{width:100%;border-collapse:collapse;font-size:11px}
-th{color:var(--text3);text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);text-transform:uppercase;font-size:9px;letter-spacing:.8px;font-weight:600;position:sticky;top:0;background:var(--bg1)}
-td{padding:7px 10px;border-bottom:1px solid rgba(26,34,53,.5)}
+th{color:var(--text3);text-align:left;padding:9px 12px;border-bottom:1px solid var(--border);text-transform:uppercase;font-size:8px;letter-spacing:1px;font-weight:700;position:sticky;top:0;background:var(--bg1);z-index:1}
+td{padding:8px 12px;border-bottom:1px solid rgba(21,32,53,.6)}
+tr{transition:all .15s}
 tr:hover{background:var(--bg3)}
-.green{color:var(--green)}.red{color:var(--red)}.gray{color:var(--text3)}.gold{color:var(--gold)}.sky{color:var(--sky)}
+.green{color:var(--green)}.red{color:var(--red)}.gray{color:var(--text3)}.gold{color:var(--gold)}.sky{color:var(--sky)}.cyan{color:var(--cyan)}.purple{color:var(--purple)}.orange{color:var(--orange)}
 
-.forecast-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;padding:14px}
-.fc-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}
-.fc-city{font-size:11px;font-weight:700;color:var(--sky);margin-bottom:6px}
-.fc-row{display:flex;justify-content:space-between;font-size:10px;margin-bottom:3px}
-.fc-temp{font-weight:600}
+/* === FORECAST CARDS === */
+.fc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;padding:12px}
+.fc-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;transition:all .2s}
+.fc-card:hover{border-color:var(--sky);background:var(--bg2)}
+.fc-city{font-size:11px;font-weight:700;color:var(--sky);margin-bottom:2px}
+.fc-station{font-size:8px;color:var(--text3);letter-spacing:.5px;margin-bottom:6px}
+.fc-row{display:flex;justify-content:space-between;align-items:center;font-size:10px;margin-bottom:2px;padding:2px 0}
+.fc-temp-hi{color:var(--red);font-weight:700}
+.fc-temp-lo{color:var(--cyan);font-weight:700}
+.fc-precip{color:var(--blue);font-size:9px}
+.fc-ens{font-size:8px;color:var(--purple);margin-top:4px;padding-top:4px;border-top:1px solid var(--border)}
 
-.empty{color:var(--text3);text-align:center;padding:24px;font-size:11px;font-style:italic}
-.status-bar{background:var(--bg1);border-top:1px solid var(--border);padding:8px 24px;font-size:10px;color:var(--text3)}
+/* === EDGE CARDS === */
+.edge-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;padding:12px}
+.edge-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px}
+.edge-card-title{font-size:9px;color:var(--gold);text-transform:uppercase;letter-spacing:1.5px;font-weight:700;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.edge-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;font-size:10px}
+.edge-bar-wrap{flex:1;height:5px;background:var(--bg2);border-radius:3px;overflow:hidden;margin:0 8px}
+.edge-bar{height:100%;border-radius:3px;transition:width .5s ease}
+.edge-badge{font-size:8px;font-weight:700;padding:1px 5px;border-radius:2px;min-width:32px;text-align:center}
+
+/* === CITY HEAT MAP === */
+.city-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px;padding:12px}
+.city-chip{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;text-align:center;transition:all .2s;cursor:default}
+.city-chip:hover{border-color:var(--sky)}
+.city-name{font-size:9px;font-weight:700;color:var(--sky)}
+.city-stat{font-size:14px;font-weight:800;margin:3px 0}
+.city-sub{font-size:8px;color:var(--text3)}
+
+/* === FOOTER === */
+.footer{background:var(--bg1);border-top:1px solid var(--border);padding:8px 28px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:9px;color:var(--text3)}
+.footer span{display:flex;align-items:center;gap:6px}
+
+.empty{color:var(--text3);text-align:center;padding:28px;font-size:11px;font-style:italic}
+.tag{display:inline-block;font-size:8px;padding:1px 5px;border-radius:2px;font-weight:600;letter-spacing:.5px}
+.tag-ens{background:rgba(128,96,255,.15);color:var(--purple)}
+.tag-det{background:rgba(90,106,138,.15);color:var(--text2)}
 </style>
 </head>
 <body>
 
-<div class="header-bar">
-  <div class="header-left">
-    <span class="brand">Weather Edge</span>
+<!-- Header -->
+<div class="header">
+  <div class="h-left">
+    <div>
+      <div class="brand">Weather Edge</div>
+      <div class="brand-sub">Kalshi Trading Terminal</div>
+    </div>
     <span class="live-dot dot-paper" id="mode-dot"></span>
-    <span class="mode-badge mode-paper" id="mode-badge">PAPER MODE</span>
+    <span class="mode-badge mode-paper" id="mode-badge">PAPER</span>
   </div>
-  <div class="header-right">
-    <span>Min Edge: 15%</span>
-    <span>|</span>
-    <span>Sell: +50%</span>
-    <span>|</span>
-    <span id="cycle-info">--</span>
+  <div class="h-right">
+    <span class="h-pill">Edge >= 8%</span>
+    <span class="sep">|</span>
+    <span class="h-pill">Kelly 15%</span>
+    <span class="sep">|</span>
+    <span class="h-pill">GFS 31-Member Ensemble</span>
+    <span class="sep">|</span>
+    <span>Cycle <span id="hd-cycle">--</span></span>
   </div>
 </div>
 
-<div class="main-wrap">
+<!-- Main -->
+<div class="main">
 
-<div class="hero-card full">
+<!-- Hero P&L -->
+<div class="hero">
   <div class="hero-label">Overall Profit & Loss</div>
-  <div class="hero-value" id="tb-overall">...</div>
-  <div class="hero-sub">
-    <div class="hero-sub-item"><div class="hero-sub-label">Unrealized</div><div class="hero-sub-value" id="tb-unreal">...</div></div>
-    <div class="hero-sub-item"><div class="hero-sub-label">Realized</div><div class="hero-sub-value" id="tb-real">...</div></div>
-    <div class="hero-sub-item"><div class="hero-sub-label">Win Rate</div><div class="hero-sub-value" id="tb-winrate">...</div></div>
-    <div class="hero-sub-item"><div class="hero-sub-label">Cities</div><div class="hero-sub-value" id="tb-cities">...</div></div>
+  <div class="hero-val" id="hero-pnl">...</div>
+  <div class="hero-row">
+    <div class="hero-item"><div class="hero-item-label">Unrealized</div><div class="hero-item-val" id="h-unreal">--</div></div>
+    <div class="hero-item"><div class="hero-item-label">Realized</div><div class="hero-item-val" id="h-real">--</div></div>
+    <div class="hero-item"><div class="hero-item-label">Today</div><div class="hero-item-val" id="h-today">--</div></div>
+    <div class="hero-item"><div class="hero-item-label">Win Rate</div><div class="hero-item-val" id="h-wr">--</div></div>
+    <div class="hero-item"><div class="hero-item-label">Edge Accuracy</div><div class="hero-item-val" id="h-edge">--</div></div>
+    <div class="hero-item"><div class="hero-item-label">Stations</div><div class="hero-item-val cyan" id="h-stations">--</div></div>
   </div>
 </div>
 
-<div class="stats-bar full">
-  <div class="stat-card a-sky"><div class="stat-label">Portfolio</div><div class="stat-value" id="st-port">--</div></div>
-  <div class="stat-card a-green"><div class="stat-label">Cash</div><div class="stat-value" id="st-cash">--</div></div>
-  <div class="stat-card a-gold"><div class="stat-label">Open</div><div class="stat-value" id="st-open">--</div></div>
-  <div class="stat-card a-green"><div class="stat-label">Wins</div><div class="stat-value green" id="st-wins">--</div></div>
-  <div class="stat-card a-red"><div class="stat-label">Losses</div><div class="stat-value red" id="st-losses">--</div></div>
-  <div class="stat-card a-sky"><div class="stat-label">Avg Win</div><div class="stat-value green" id="st-avgw">--</div></div>
-  <div class="stat-card a-red"><div class="stat-label">Avg Loss</div><div class="stat-value red" id="st-avgl">--</div></div>
+<!-- Stats -->
+<div class="stats" id="stats-bar">
+  <div class="stat a-sky"><div class="s-label">Portfolio</div><div class="s-val" id="s-port">--</div></div>
+  <div class="stat a-green"><div class="s-label">Cash</div><div class="s-val" id="s-cash">--</div></div>
+  <div class="stat a-gold"><div class="s-label">Open Positions</div><div class="s-val" id="s-open">--</div></div>
+  <div class="stat a-green"><div class="s-label">Wins</div><div class="s-val green" id="s-wins">--</div></div>
+  <div class="stat a-red"><div class="s-label">Losses</div><div class="s-val red" id="s-losses">--</div></div>
+  <div class="stat a-purple"><div class="s-label">Avg Edge</div><div class="s-val purple" id="s-avgedge">--</div></div>
+  <div class="stat a-cyan"><div class="s-label">Contracts</div><div class="s-val cyan" id="s-contracts">--</div></div>
+  <div class="stat a-orange"><div class="s-label">Today Trades</div><div class="s-val orange" id="s-dtrades">--</div></div>
 </div>
 
+<!-- Forecasts + Edge Analysis -->
+<div class="grid" style="margin-bottom:14px">
+  <div class="panel">
+    <div class="p-head"><h2><span class="icon">&#9729;</span> <span style="color:var(--sky)">Station Forecasts</span></h2><span class="badge" id="fc-count">--</span></div>
+    <div class="p-body" style="max-height:500px" id="fc-body"><div class="empty">Loading forecasts...</div></div>
+  </div>
+  <div class="panel">
+    <div class="p-head"><h2><span class="icon">&#9889;</span> <span style="color:var(--gold)">Edge Analysis</span></h2><span class="badge" id="edge-count">--</span></div>
+    <div class="p-body" style="max-height:500px" id="edge-body"><div class="empty">Loading edge stats...</div></div>
+  </div>
+</div>
+
+<!-- Open Positions -->
+<div class="panel full" style="margin-bottom:14px">
+  <div class="p-head"><h2><span class="icon">&#9679;</span> <span style="color:var(--green)">Open Positions</span></h2><span class="badge" id="op-count">0</span></div>
+  <div class="p-body">
+    <table><thead><tr>
+      <th>Ticker</th><th>Side</th><th>City</th><th>Station</th><th>Forecast</th><th>Edge</th><th>Ens</th><th>Qty</th><th>Entry</th><th>Bid</th><th>P&L</th>
+    </tr></thead><tbody id="op-tbody"></tbody></table>
+  </div>
+</div>
+
+<!-- Hot Markets + History -->
 <div class="grid">
-
-<div class="panel">
-  <div class="panel-header"><h2>Forecasts</h2></div>
-  <div class="panel-body" id="fc-body"><div class="empty">Loading forecasts...</div></div>
-</div>
-
-<div class="panel">
-  <div class="panel-header"><h2>Hot Markets</h2><span class="count" id="hot-count"></span></div>
-  <div class="panel-body"><table><thead><tr><th>Market</th><th>Yes</th><th>No</th><th>Vol</th></tr></thead><tbody id="hot-tbody"></tbody></table></div>
-</div>
-
-<div class="panel full">
-  <div class="panel-header"><h2>Open Positions</h2><span class="count" id="open-count"></span></div>
-  <div class="panel-body"><table><thead><tr><th>Ticker</th><th>Side</th><th>City</th><th>Type</th><th>Forecast</th><th>Edge</th><th>Entry</th><th>Bid</th><th>P&L</th></tr></thead><tbody id="open-tbody"></tbody></table></div>
-</div>
-
-<div class="panel full">
-  <div class="panel-header"><h2>Trade History</h2></div>
-  <div class="panel-body"><table><thead><tr><th>Time</th><th>Ticker</th><th>Side</th><th>City</th><th>Edge</th><th>Entry</th><th>Exit</th><th>P&L</th></tr></thead><tbody id="trades-tbody"></tbody></table></div>
+  <div class="panel">
+    <div class="p-head"><h2><span class="icon">&#128293;</span> <span style="color:var(--orange)">Hot Markets</span></h2><span class="badge" id="hot-count">0</span></div>
+    <div class="p-body">
+      <table><thead><tr><th>Market</th><th>Yes</th><th>No</th><th>Vol</th></tr></thead><tbody id="hot-tbody"></tbody></table>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="p-head"><h2><span class="icon">&#128203;</span> <span style="color:var(--cyan)">Trade History</span></h2></div>
+    <div class="p-body">
+      <table><thead><tr><th>Time</th><th>Ticker</th><th>City</th><th>Edge</th><th>Entry</th><th>Exit</th><th>P&L</th></tr></thead><tbody id="tr-tbody"></tbody></table>
+    </div>
+  </div>
 </div>
 
 </div>
-</div>
 
-<div class="status-bar">
-  <span>Kalshi Weather Edge Terminal | Cycle: <span id="sb-cycle">60s</span> | Forecasts: Open-Meteo</span>
+<!-- Footer -->
+<div class="footer">
+  <span>Weather Edge Terminal v2 | NWS Station-Targeted | GFS Ensemble | Kelly Criterion</span>
+  <span>Sell +50% | Circuit: $300/day | Max 20 positions | Forecast: Open-Meteo</span>
 </div>
 
 <script>
 const $=s=>document.getElementById(s);
-const pnlClass=v=>v>0?'green':v<0?'red':'gray';
+const pc=v=>v>0?'green':v<0?'red':'gray';
 const fmt=v=>'$'+Math.abs(v).toFixed(2);
-const pnlFmt=v=>(v>=0?'+':'-')+fmt(v);
+const pf=v=>(v>=0?'+':'')+fmt(v);
 
 async function refresh(){
   try{
-    const [status,open,trades,hot,fc]=await Promise.all([
+    const [st,op,tr,hot,fc,es]=await Promise.all([
       fetch('/api/status').then(r=>r.json()),
       fetch('/api/open').then(r=>r.json()),
       fetch('/api/trades').then(r=>r.json()),
       fetch('/api/hot').then(r=>r.json()),
       fetch('/api/forecasts').then(r=>r.json()),
+      fetch('/api/edge_stats').then(r=>r.json()),
     ]);
 
     // Mode
-    if(status.mode==='LIVE'){
-      $('mode-dot').className='live-dot dot-live';
-      $('mode-badge').className='mode-badge mode-live';
-      $('mode-badge').textContent='LIVE';
-    }
+    if(st.mode==='LIVE'){$('mode-dot').className='live-dot dot-live';$('mode-badge').className='mode-badge mode-live';$('mode-badge').textContent='LIVE';}
 
     // Hero
-    const ov=status.overall_pnl||0;
-    $('tb-overall').innerHTML=`<span class="${pnlClass(ov)}">${pnlFmt(ov)}</span>`;
-    const ur=status.round_pnl||0;
-    $('tb-unreal').innerHTML=`<span class="${pnlClass(ur)}">${pnlFmt(ur)}</span>`;
-    const re=status.net_pnl||0;
-    $('tb-real').innerHTML=`<span class="${pnlClass(re)}">${pnlFmt(re)}</span>`;
-    const wr=status.wins+status.losses>0?((status.wins/(status.wins+status.losses))*100).toFixed(1)+'%':'--';
-    $('tb-winrate').textContent=wr;
-    $('tb-cities').textContent=status.cities_tracked||0;
+    const ov=st.overall_pnl||0;
+    $('hero-pnl').innerHTML=`<span class="${pc(ov)}">${pf(ov)}</span>`;
+    const ur=st.round_pnl||0;$('h-unreal').innerHTML=`<span class="${pc(ur)}">${pf(ur)}</span>`;
+    const re=st.net_pnl||0;$('h-real').innerHTML=`<span class="${pc(re)}">${pf(re)}</span>`;
+    const td=st.daily_pnl||0;$('h-today').innerHTML=`<span class="${pc(td)}">${pf(td)}</span>`;
+    const tot=st.wins+st.losses;
+    $('h-wr').innerHTML=tot>0?`<span class="${st.wins/tot>.5?'green':'red'}">${(st.wins/tot*100).toFixed(1)}%</span>`:'--';
+    $('h-edge').innerHTML=st.edge_sample>0?`<span class="${st.edge_accuracy>50?'green':'red'}">${st.edge_accuracy}%</span> <span style="font-size:9px;color:var(--text3)">(${st.edge_sample})</span>`:'--';
+    $('h-stations').textContent=`${st.cities_tracked}/${st.stations_total}`;
+    $('hd-cycle').textContent=st.cycle||'--';
 
     // Stats
-    $('st-port').textContent=fmt(status.portfolio||0);
-    $('st-cash').textContent=fmt(status.cash||0);
-    $('st-open').textContent=status.open_count||0;
-    $('st-wins').textContent=status.wins||0;
-    $('st-losses').textContent=status.losses||0;
-    $('st-avgw').textContent=status.avg_win?pnlFmt(status.avg_win):'--';
-    $('st-avgl').textContent=status.avg_loss?pnlFmt(status.avg_loss):'--';
+    $('s-port').textContent=fmt(st.portfolio||0);
+    $('s-cash').textContent=fmt(st.cash||0);
+    $('s-open').textContent=st.open_count||0;
+    $('s-wins').textContent=st.wins||0;
+    $('s-losses').textContent=st.losses||0;
+    $('s-avgedge').textContent=st.avg_edge?st.avg_edge+'%':'--';
+    $('s-contracts').textContent=st.total_contracts||0;
+    $('s-dtrades').textContent=st.daily_trades||0;
 
     // Forecasts
-    let fcHtml='<div class="forecast-grid">';
-    for(const [key,data] of Object.entries(fc)){
-      fcHtml+=`<div class="fc-card"><div class="fc-city">${data.name}</div>`;
-      for(const d of (data.forecasts||[])){
-        fcHtml+=`<div class="fc-row"><span>${d.date}</span><span class="fc-temp red">${d.high_f?.toFixed(0)||'?'}F</span><span class="fc-temp sky">${d.low_f?.toFixed(0)||'?'}F</span><span>${d.precip_mm?.toFixed(1)||0}mm</span></div>`;
+    const fcKeys=Object.keys(fc).sort();
+    $('fc-count').textContent=fcKeys.length+' stations';
+    let fcH='<div class="fc-grid">';
+    for(const k of fcKeys){
+      const c=fc[k];
+      fcH+=`<div class="fc-card"><div class="fc-city">${c.name}</div><div class="fc-station">${c.station} - ${c.station_name}</div>`;
+      for(const d of (c.forecasts||[])){
+        const hi=d.high_f!=null?d.high_f.toFixed(0):'?';
+        const lo=d.low_f!=null?d.low_f.toFixed(0):'?';
+        const pr=d.precip_mm!=null?d.precip_mm.toFixed(1):'0';
+        fcH+=`<div class="fc-row"><span style="color:var(--text2)">${d.date?.slice(5)||'?'}</span><span class="fc-temp-hi">${hi}°</span><span class="fc-temp-lo">${lo}°</span><span class="fc-precip">${pr}mm</span></div>`;
       }
-      fcHtml+='</div>';
+      fcH+=`<div class="fc-ens">${c.ensemble_size>1?'&#9733; '+c.ensemble_size+' ensemble members':'&#9675; deterministic only'}</div>`;
+      fcH+='</div>';
     }
-    fcHtml+='</div>';
-    $('fc-body').innerHTML=fcHtml||'<div class="empty">No forecasts</div>';
+    fcH+='</div>';
+    $('fc-body').innerHTML=fcH;
+
+    // Edge analysis
+    $('edge-count').textContent=(es.total||0)+' trades analyzed';
+    let eH='<div class="edge-grid">';
+
+    // Edge buckets
+    eH+='<div class="edge-card"><div class="edge-card-title">Win Rate by Edge Size</div>';
+    for(const [k,v] of Object.entries(es.edge_buckets||{})){
+      const wr=v.wr||0;const col=wr>=60?'var(--green)':wr>=45?'var(--gold)':'var(--red)';
+      eH+=`<div class="edge-row"><span style="min-width:50px">${k}</span><div class="edge-bar-wrap"><div class="edge-bar" style="width:${wr}%;background:${col}"></div></div><span class="edge-badge" style="color:${col}">${wr}%</span><span style="color:var(--text3);font-size:9px;margin-left:4px">(${v.total})</span></div>`;
+    }
+    eH+='</div>';
+
+    // Ensemble vs deterministic
+    eH+='<div class="edge-card"><div class="edge-card-title">Ensemble vs Deterministic</div>';
+    eH+=`<div class="edge-row"><span>Ensemble (31)</span><div class="edge-bar-wrap"><div class="edge-bar" style="width:${es.ensemble_wr||0}%;background:var(--purple)"></div></div><span class="edge-badge" style="color:var(--purple)">${es.ensemble_wr||0}%</span><span style="color:var(--text3);font-size:9px;margin-left:4px">(${es.ensemble_n||0})</span></div>`;
+    eH+=`<div class="edge-row"><span>Deterministic</span><div class="edge-bar-wrap"><div class="edge-bar" style="width:${es.deterministic_wr||0}%;background:var(--text2)"></div></div><span class="edge-badge" style="color:var(--text2)">${es.deterministic_wr||0}%</span><span style="color:var(--text3);font-size:9px;margin-left:4px">(${es.deterministic_n||0})</span></div>`;
+    eH+='</div>';
+
+    // City performance
+    eH+='<div class="edge-card"><div class="edge-card-title">Performance by City</div>';
+    for(const [k,v] of Object.entries(es.city_stats||{}).sort((a,b)=>b[1].pnl-a[1].pnl)){
+      const col=v.pnl>=0?'var(--green)':'var(--red)';
+      eH+=`<div class="edge-row"><span class="sky" style="min-width:35px">${k}</span><span style="color:${col};min-width:55px">${v.pnl>=0?'+':''}$${v.pnl.toFixed(2)}</span><span style="color:var(--text2)">${v.wr}% (${v.total})</span></div>`;
+    }
+    eH+='</div>';
+
+    eH+='</div>';
+    $('edge-body').innerHTML=eH;
+
+    // Open positions
+    $('op-count').textContent=op.length;
+    $('op-tbody').innerHTML=op.map(p=>{
+      const cls=pc(p.unrealized);
+      const ensTag=p.ensemble_size>1?'<span class="tag tag-ens">ENS '+p.ensemble_size+'</span>':'<span class="tag tag-det">DET</span>';
+      return `<tr><td>${p.ticker}</td><td>${p.side}</td><td class="sky">${p.city}</td><td style="font-size:9px;color:var(--text2)">${p.station}</td><td>${p.forecast_value?.toFixed(1)||'?'}</td><td class="purple">${(p.edge*100).toFixed(0)}%</td><td>${ensTag}</td><td>${p.count}</td><td>$${p.entry?.toFixed(2)}</td><td>$${p.current_bid?.toFixed(2)}</td><td class="${cls}">${pf(p.unrealized)} (${p.gain_pct>0?'+':''}${p.gain_pct}%)</td></tr>`;
+    }).join('')||'<tr><td colspan=11 class="empty">No open positions</td></tr>';
 
     // Hot markets
     $('hot-count').textContent=hot.length;
-    $('hot-tbody').innerHTML=hot.map(m=>`<tr><td title="${m.title}">${m.ticker}</td><td>$${m.yes_ask?.toFixed(2)}</td><td>$${m.no_ask?.toFixed(2)}</td><td>${m.volume}</td></tr>`).join('')||'<tr><td colspan=4 class="empty">No markets</td></tr>';
-
-    // Open positions
-    $('open-count').textContent=open.length;
-    $('open-tbody').innerHTML=open.map(p=>{
-      const cls=pnlClass(p.unrealized);
-      return `<tr><td>${p.ticker}</td><td>${p.side}</td><td>${p.city}</td><td>${p.market_type}</td><td>${p.forecast_value?.toFixed(1)}</td><td class="sky">${(p.edge*100).toFixed(0)}%</td><td>$${p.entry?.toFixed(2)}</td><td>$${p.current_bid?.toFixed(2)}</td><td class="${cls}">${pnlFmt(p.unrealized)} (${p.gain_pct>0?'+':''}${p.gain_pct}%)</td></tr>`;
-    }).join('')||'<tr><td colspan=9 class="empty">No positions</td></tr>';
+    $('hot-tbody').innerHTML=hot.map(m=>`<tr><td title="${m.title}">${m.ticker}</td><td>$${m.yes_ask?.toFixed(2)}</td><td>$${m.no_ask?.toFixed(2)}</td><td>${m.volume?.toLocaleString()}</td></tr>`).join('')||'<tr><td colspan=4 class="empty">No markets</td></tr>';
 
     // Trade history
-    $('trades-tbody').innerHTML=trades.map(t=>{
-      const cls=pnlClass(t.pnl);
-      return `<tr><td>${new Date(t.created_at).toLocaleString()}</td><td>${t.ticker}</td><td>${t.side}</td><td>${t.city}</td><td class="sky">${(t.edge*100).toFixed(0)}%</td><td>$${t.entry?.toFixed(2)}</td><td>$${t.exit?.toFixed(2)}</td><td class="${cls}">${pnlFmt(t.pnl)}</td></tr>`;
-    }).join('')||'<tr><td colspan=8 class="empty">No trades yet</td></tr>';
+    $('tr-tbody').innerHTML=tr.map(t=>{
+      const cls=pc(t.pnl);
+      return `<tr><td style="font-size:9px">${new Date(t.created_at).toLocaleString()}</td><td>${t.ticker}</td><td class="sky">${t.city}</td><td class="purple">${(t.edge*100).toFixed(0)}%</td><td>$${t.entry?.toFixed(2)}</td><td>$${t.exit?.toFixed(2)}</td><td class="${cls}">${pf(t.pnl)}</td></tr>`;
+    }).join('')||'<tr><td colspan=7 class="empty">No trades yet</td></tr>';
 
   }catch(e){console.error('Refresh error:',e)}
 }
@@ -1158,8 +1460,11 @@ setInterval(refresh,10000);
 
 def bot_loop():
     mode = "PAPER" if not ENABLE_TRADING else "LIVE"
-    logger.info(f"Weather Edge Bot starting [{mode}] -- min edge {MIN_EDGE*100:.0f}%, sell +{SELL_PROFIT_PCT*100:.0f}%, {CONTRACTS} contracts, {CASH_RESERVE*100:.0f}% reserve")
-    logger.info(f"Tracking {len(ALL_SERIES)} weather series across {len(CITIES)} cities")
+    logger.info(f"=== WEATHER EDGE BOT [{mode}] ===")
+    logger.info(f"Strategy: min edge {MIN_EDGE*100:.0f}%, Kelly {15}%, max ${MAX_BET}/trade")
+    logger.info(f"Circuit breakers: ${DAILY_LOSS_LIMIT}/day loss limit, {MAX_DAILY_TRADES} trades/day")
+    logger.info(f"Tracking {len(STATIONS)} NWS stations across {len(set(TEMP_SERIES.values()))} cities")
+    logger.info(f"Settlement source: NWS Daily Climate Report (CLI)")
 
     while True:
         try:
