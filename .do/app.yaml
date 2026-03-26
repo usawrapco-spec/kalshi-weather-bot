@@ -1,0 +1,40 @@
+name: kalshi-weather-bot
+region: nyc
+services:
+  - name: weather-bot
+    github:
+      repo: usawrapco-spec/kalshi-weather-bot
+      branch: master
+      deploy_on_push: true
+    run_command: python bot.py
+    environment_slug: python
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    http_port: 8080
+    envs:
+      - key: KALSHI_API_KEY_ID
+        scope: RUN_TIME
+        type: SECRET
+      - key: KALSHI_PRIVATE_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: KALSHI_API_HOST
+        scope: RUN_TIME
+        value: "https://api.elections.kalshi.com"
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+      - key: ENABLE_TRADING
+        scope: RUN_TIME
+        value: "false"
+      - key: PORT
+        scope: RUN_TIME
+        value: "8080"
+    health_check:
+      http_path: /
+      timeout_seconds: 30
+databases:
+  - name: kalshi-weather-db
+    engine: PG
+    production: false
+    version: "16"
